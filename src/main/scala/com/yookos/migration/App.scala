@@ -7,6 +7,8 @@ import akka.util.Timeout
 
 import org.apache.spark._
 import org.apache.spark.sql._
+import org.apache.spark.streaming.{ Milliseconds, Seconds, StreamingContext, Time }
+import org.apache.spark.streaming.receiver._
 
 import com.datastax.spark.connector._
 import com.datastax.spark.connector.rdd._
@@ -36,6 +38,12 @@ object App extends App {
   Config.setSparkConf(mode, conf)
   val cache = Config.redisClient(mode)
   val sc = new SparkContext(conf)
+  
+  if (mode != "local") {
+    sc.addJar("hdfs:///user/hadoop-user/data/jars/postgresql-9.4-1200-jdbc41.jar")
+    sc.addJar("hdfs:///user/hadoop-user/data/jars/migration-binary-reduce-0.1-SNAPSHOT.jar")
+  }
+
   val sqlContext = new org.apache.spark.sql.SQLContext(sc)
 
   val system = SparkEnv.get.actorSystem
@@ -75,8 +83,8 @@ object App extends App {
 
   reduceFiles(df)
   
-  protected def reduceFiles(df: DataFrame) = {
-    df.collect().foreach(row => {
+  def reduceFiles(mdf: DataFrame) = {
+    mdf.collect().foreach(row => {
       cachedIndex = cachedIndex + 1
       cache.set("latest_legacy_files_index", cachedIndex.toString)
       val userid = row.getLong(0)
@@ -84,38 +92,45 @@ object App extends App {
     })
   }
 
-  private def upsert(row: Row, jiveuserid: Long) = {
-    legacyfilesDF.select(legacyfilesDF("attachmentid"), legacyfilesDF("objectid"), legacyfilesDF("objecttype"), legacyfilesDF("filename"), legacyfilesDF("filesize"), legacyfilesDF("contenttype"), legacyfilesDF("creationdate"), legacyfilesDF("modificationdate")).filter(f"objectid = $jiveuserid%d").foreach {
-
-    legacyfile =>
-      // @todo Construct the binary filename as stored in the binstore
-      // To find the specific directory of the file, 
-      // we will need to take the first 3 characters of the file 
-      // and turn those into 3 levels of directories.
-      // For example, 500154tnemhcatta.bin
-      val attachmentid = legacyfile.getLong(0)
-      val binaryFilename = attachmentid + "54" + "tnemhcatta.bin"
-      sc.parallelize(Seq(Tuple14(
-        java.util.UUID.randomUUID().toString(),
-        attachmentid,
-        row.getLong(0),
-        row.getString(1),
-        row.getString(2),
-        legacyfile.getLong(1),
-        legacyfile.getLong(2),
-        legacyfile.getString(3),
-        binaryFilename,
-        legacyfile.getLong(4),
-        legacyfile.getString(5),
-        Some(null),
-        legacyfile.getLong(6),
-        legacyfile.getLong(7))))
-          .saveToCassandra(s"$keyspace", "legacyjiveattachment", SomeColumns("fileid, jiveattachmentid", "jiveuserid", "userid",
-            "author", "objectid", "objecttype",
-            "filename", "binaryfilename", "filesize", "contenttype",
-            "imageurl", "creationdate", "modificationdate"))
+  def upsert(row: Row, jiveuserid: Long) = {
+    val attachment = legacyfilesDF.select(legacyfilesDF("attachmentid"), legacyfilesDF("objectid"), legacyfilesDF("objecttype"), legacyfilesDF("filename"), legacyfilesDF("filesize"), legacyfilesDF("contenttype"), legacyfilesDF("creationdate"), legacyfilesDF("modificationdate")).filter(f"objectid = $jiveuserid%d").collect()
+      
+    if (!attachment.isEmpty) {
+      attachment.foreach {
+        legacyfile =>
+          // @todo Construct the binary filename as stored in the binstore
+          // To find the specific directory of the file, 
+          // we will need to take the first 3 characters of the file 
+          // and turn those into 3 levels of directories.
+          // For example, 500154tnemhcatta.bin
+          println("===Retrieved attachmentid value=== " + legacyfile.getLong(0))
+          val attachmentid = legacyfile.getLong(0)
+          val binaryFilename = attachmentid + "54" + "tnemhcatta.bin"
+          val fileid = java.util.UUID.randomUUID().toString()
+          val jiveattachmentid = attachmentid
+          val legacyjiveuserid = jiveuserid
+          val userid = row.getString(1)
+          val author = row.getString(2)
+          val objectid = legacyfile.getLong(1)
+          val objecttype = legacyfile.getInt(2)
+          val filename = legacyfile.getString(3)
+          val filesize = legacyfile.getInt(4)
+          val contenttype = legacyfile.getString(5)
+          val imageurl = Some(null)
+          val creationdate = legacyfile.getLong(6)
+          val modificationdate = legacyfile.getLong(7)
+          sc.parallelize(Seq(JiveAttachment(
+            fileid, jiveattachmentid, legacyjiveuserid, userid,
+            author, objectid, objecttype, filename, binaryFilename,
+            filesize, contenttype, imageurl, 
+            creationdate, modificationdate )))
+              .saveToCassandra(s"$keyspace", "legacyjiveattachment", SomeColumns("fileid", "jiveattachmentid", "jiveuserid", "userid",
+                "author", "objectid", "objecttype",
+                "filename", "binaryfilename", "filesize", "contenttype",
+                "imageurl", "creationdate", "modificationdate"))
+      }
     }
-        
+    
     println("===Latest JiveAttachment cachedIndex=== " + cache.get("latest_legacy_files_index").toInt)
   }
 
@@ -124,7 +139,7 @@ object App extends App {
     val replicationStrategy = Config.cassandraConfig(mode, Some("replStrategy"))
     CassandraConnector(conf).withSessionDo { sess =>
       sess.execute(s"CREATE KEYSPACE IF NOT EXISTS $keyspace WITH REPLICATION = $replicationStrategy")
-      sess.execute(s"CREATE TABLE IF NOT EXISTS $keyspace.legacyjiveattachment (fileid text, jiveattachmentid bigint, jiveuserid bigint, userid text, author text, objectid bigint, objecttype bigint, filename text, binaryfilename text, filesize bigint, contenttype text, imageurl text, creationdate bigint, modificationdate bigint, PRIMARY KEY ((fileid, userid), author)) WITH CLUSTERING ORDER BY (author DESC)")
+      sess.execute(s"CREATE TABLE IF NOT EXISTS $keyspace.legacyjiveattachment (fileid text, jiveattachmentid bigint, jiveuserid bigint, userid text, author text, objectid bigint, objecttype int, filename text, binaryfilename text, filesize int, contenttype text, imageurl text, creationdate bigint, modificationdate bigint, PRIMARY KEY ((fileid, userid), author)) WITH CLUSTERING ORDER BY (author DESC)")
     } wasApplied
   }
 }
